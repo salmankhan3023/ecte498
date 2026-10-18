@@ -55,7 +55,8 @@ for p in file_paths:
     d = pd.read_csv(p, low_memory=False, encoding_errors='replace')
     d.columns = d.columns.str.strip()
     print(f"   {os.path.basename(p)}: {len(d):,} rows")
-    df_list.append(d[t3_cols + ['Label']])
+    keep = t3_cols + ['Label'] + (['flow_uid'] if 'flow_uid' in d.columns else [])
+    df_list.append(d[keep])
 
 df = pd.concat(df_list, axis=0, ignore_index=True)
 del df_list
