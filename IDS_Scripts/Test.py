@@ -9,11 +9,7 @@ import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import tensorflow as tf
 
-try:
-    from numba import njit
-except ImportError:
-    def njit(*args, **kwargs):
-        return lambda f: f
+from entropy_utils import shannon_entropy, seed_entropy, PayloadStore, SAMPLE_RATIO
 
 # ============================================================
 # 1. SETUP & LOAD SAVED ASSETS
@@ -26,8 +22,14 @@ THRESHOLD = 0.96
 SEED = 42
 LAT_SAMPLE = 10000       # packets used for the one-at-a-time latency run
 CPU_POWER_W = 25.0       # assumed avg CPU power under load (not measured), E = P * t
-MAX_FLOW_PAYLOAD = 4096
-ENTROPY_SAMPLE = 0.30
+ENTROPY_SAMPLE = SAMPLE_RATIO
+entropy_col = 'entropy_mean'
+
+# True: entropy is computed here from the raw payload, only for flows that leave Tier 1
+# False: uses the entropy_mean already stored in test.csv
+LIVE_ENTROPY = True
+PAYLOAD_DIR = r"D:\Subjects\ECTE 498\IDS\Salman scripts"
+DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday']
 
 print("--- Loading Models and Test Data ---")
 with open(os.path.join(SAVE_DIR, 'features.json')) as f:
@@ -51,6 +53,14 @@ print(f"✅ {n_test:,} test samples, {len(class_names)} classes")
 X3 = df_test[t3_cols].values.astype(np.float32)
 X2 = X3[:, :len(t2_cols)]
 X1 = X3[:, :len(t1_cols)]
+ent_col = t3_cols.index(entropy_col)
+
+if LIVE_ENTROPY:
+    if 'flow_uid' not in df_test.columns:
+        raise SystemExit("test.csv has no flow_uid - rerun 0_append_entropy.py and 1_split_data.py")
+    store = PayloadStore(PAYLOAD_DIR, DAYS)
+    uids = df_test['flow_uid'].values
+    seed_entropy(SEED + 1)    # fresh draw, not the one the csv entropy came from
 
 # ============================================================
 # 2. TIERED INFERENCE (full test set)
@@ -67,6 +77,9 @@ tier_log[t1_mask] = 'Tier 1'
 
 rem_idx = np.where(~t1_mask)[0]
 if len(rem_idx):
+    if LIVE_ENTROPY:
+        # payload is only touched for flows Tier 1 could not resolve (X2 is a view of X3)
+        X3[rem_idx, ent_col] = [shannon_entropy(store.get(u), ENTROPY_SAMPLE) for u in uids[rem_idx]]
     p2 = rf_t2.predict_proba(X2[rem_idx])
     t2_local = p2.max(axis=1) >= THRESHOLD
     t2_idx = rem_idx[t2_local]
@@ -85,6 +98,12 @@ tier_colors = {'Tier 1': 'steelblue', 'Tier 2': 'seagreen', 'Tier 3': 'mediumpur
 for t in tiers:
     print(f"   {t}: {(tier_log == t).sum():,} ({(tier_log == t).mean()*100:.2f}%)")
 print(f"   Tier 3 flows flagged for analyst review: {analyst_alert.sum():,}")
+
+escalated = tier_log != 'Tier 1'
+bytes_all = df_test['total_payload_bytes'].values.sum()
+bytes_touched = df_test['total_payload_bytes'].values[escalated].sum()
+print(f"   Flows with payload access: {escalated.sum():,} ({escalated.mean()*100:.2f}%)")
+print(f"   Payload bytes accessed: {bytes_touched/max(bytes_all, 1)*100:.2f}% of captured bytes")
 
 # ============================================================
 # 3. VISUALIZATIONS & SAVING
@@ -226,6 +245,9 @@ summary_lines = [
     f"Total Missed Attacks (FN) : {total_missed}",
     f"Total False Flags  (FP)   : {total_false_flags}",
     f"Tier 3 analyst alerts     : {int(analyst_alert.sum())}",
+    f"Entropy source            : {'live (Numba, from raw payload)' if LIVE_ENTROPY else 'precomputed csv column'}",
+    f"Flows with payload access : {escalated.sum():,} ({escalated.mean()*100:.2f}%)",
+    f"Payload bytes accessed    : {bytes_touched/max(bytes_all, 1)*100:.2f}% of captured bytes",
     "",
     "Tier Breakdown:",
 ]
@@ -240,23 +262,6 @@ print("\n".join(summary_lines))
 # ============================================================
 print("\n--- Latency & Energy Simulation ---")
 
-@njit(cache=True)
-def shannon_entropy(payload, ratio):
-    counts = np.zeros(256, dtype=np.int64)
-    n = 0
-    for b in payload:
-        if np.random.random() < ratio:
-            counts[b] += 1
-            n += 1
-    if n == 0:
-        return 0.0
-    h = 0.0
-    for c in counts:
-        if c > 0:
-            p = c / n
-            h -= p * np.log2(p)
-    return h
-
 def dl_infer(x):
     return dl_model(x, training=False).numpy()
 
@@ -268,10 +273,12 @@ rng = np.random.default_rng(SEED)
 n_lat = min(LAT_SAMPLE, n_test)
 samp = rng.choice(n_test, n_lat, replace=False)
 
-# the csv only stores the entropy value, so a payload of the recorded size is generated
-# (outside the timer) to measure what the Numba entropy step costs per flow
-pay_len = np.minimum(df_test['total_payload_bytes'].values[samp], MAX_FLOW_PAYLOAD).astype(int)
-payloads = [rng.integers(0, 256, size=max(n, 0), dtype=np.uint8) for n in pay_len]
+# payloads are fetched outside the timer (in a real deployment the bytes are already in the packet buffer)
+if LIVE_ENTROPY:
+    payloads = [store.get(u) for u in uids[samp]]
+else:
+    pay_len = np.minimum(df_test['total_payload_bytes'].values[samp], 4096).astype(int)
+    payloads = [rng.integers(0, 256, size=max(n, 0), dtype=np.uint8) for n in pay_len]
 
 # warm-up so JIT / graph tracing isn't counted
 shannon_entropy(payloads[0], ENTROPY_SAMPLE)
@@ -285,11 +292,14 @@ for k, i in enumerate(samp):
     p = rf_t1.predict_proba(X1[i:i+1])[0]
     tier, pred = 1, rf_t1.classes_[p.argmax()]
     if p.max() < THRESHOLD:
-        shannon_entropy(payloads[k], ENTROPY_SAMPLE)
-        p = rf_t2.predict_proba(X2[i:i+1])[0]
+        x3 = X3[i:i+1].copy()
+        h = shannon_entropy(payloads[k], ENTROPY_SAMPLE)
+        if LIVE_ENTROPY:
+            x3[0, ent_col] = h
+        p = rf_t2.predict_proba(x3[:, :len(t2_cols)])[0]
         tier, pred = 2, rf_t2.classes_[p.argmax()]
         if p.max() < THRESHOLD:
-            p = dl_infer(scaler_t3.transform(X3[i:i+1]))[0]
+            p = dl_infer(scaler_t3.transform(x3))[0]
             tier, pred = 3, p.argmax()
     t_lat.append((time.perf_counter() - t0) * 1000)
     t_tier.append(tier)
@@ -301,7 +311,10 @@ for k, i in enumerate(samp):
 d_lat, d_pred = [], []
 for k, i in enumerate(samp):
     t0 = time.perf_counter()
-    p = dl_infer(scaler_t3.transform(X3[i:i+1]))[0]
+    x3 = X3[i:i+1].copy()
+    if LIVE_ENTROPY:
+        x3[0, ent_col] = shannon_entropy(payloads[k], ENTROPY_SAMPLE)   # the DL baseline needs entropy for every flow
+    p = dl_infer(scaler_t3.transform(x3))[0]
     d_lat.append((time.perf_counter() - t0) * 1000)
     d_pred.append(p.argmax())
     if (k + 1) % 2000 == 0:
